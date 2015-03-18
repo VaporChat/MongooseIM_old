@@ -543,8 +543,10 @@ wait_for_auth({xmlstreamelement, El}, StateData) ->
 		    end
 	    end;
 	_ ->
-	    process_unauthenticated_stanza(StateData, El),
-	    fsm_next_state(wait_for_auth, StateData)
+            case process_unauthenticated_stanza(StateData, El) of
+              {c2s_auth, NSD2} -> fsm_next_state_pack(session_established, NSD2);
+              _ -> fsm_next_state(wait_for_auth, StateData)
+            end
     end;
 wait_for_auth(timeout, StateData) ->
     {stop, normal, StateData};
@@ -689,8 +691,10 @@ wait_for_feature_request({xmlstreamelement, El}, StateData) ->
 		    send_trailer(StateData),
 		    {stop, normal, StateData};
 		true ->
-		    process_unauthenticated_stanza(StateData, El),
-		    fsm_next_state(wait_for_feature_request, StateData)
+                    case process_unauthenticated_stanza(StateData, El) of
+                      {c2s_auth, NSD2} -> fsm_next_state_pack(session_established, NSD2);
+                      _ -> fsm_next_state(wait_for_feature_request, StateData)
+                    end
 	    end
     end;
 wait_for_feature_request(timeout, StateData) ->
@@ -783,8 +787,10 @@ wait_for_sasl_response({xmlstreamelement, El}, StateData) ->
 		    fsm_next_state(wait_for_feature_request, StateData)
 	    end;
 	_ ->
-	    process_unauthenticated_stanza(StateData, El),
-	    fsm_next_state(wait_for_feature_request, StateData)
+            case process_unauthenticated_stanza(StateData, El) of
+              {c2s_auth, NSD2} -> fsm_next_state_pack(session_established, NSD2);
+              _ -> fsm_next_state(wait_for_feature_request, StateData)
+            end
     end;
 wait_for_sasl_response(timeout, StateData) ->
     {stop, normal, StateData};
@@ -1018,7 +1024,11 @@ check_amp_maybe_send(Host, State, {_FromJID, _El} = HookData) ->
 %% @doc Process packets sent by user (coming from user on c2s XMPP
 %% connection)
 -spec session_established2(El :: jlib:xmlel(), state()) -> fsm_return().
-session_established2(El, StateData) ->
+session_established2(ElIncoming, StateData) ->
+    #xmlel{attrs = AttrsIncoming} = ElIncoming,
+    UTCMTs = get_utc_timestamp(),
+    UTCAttrs = [{<<"ts">>, UTCMTs} | AttrsIncoming],
+    El = ElIncoming#xmlel{attrs = UTCAttrs},
     #xmlel{name = Name, attrs = Attrs} = El,
     User = StateData#state.user,
     Server = StateData#state.server,
@@ -1768,7 +1778,9 @@ process_presence_probe(From, To, StateData) ->
                     Packet = xml:append_subtags(
                                StateData#state.pres_last,
                                %% To is the one sending the presence (the target of the probe)
-                               [jlib:timestamp_to_xml(Timestamp, utc, To, <<>>)]),
+                               [jlib:timestamp_to_xml(Timestamp, utc, To, <<>>),
+                                %% TODO: Delete the next line once XEP-0091 is Obsolete
+                                jlib:timestamp_to_xml(Timestamp)]),
                     case privacy_check_packet(StateData, To, From, Packet, out) of
                         deny ->
                             ok;
@@ -2329,6 +2341,57 @@ get_statustag(Presence) ->
         ShowTag -> ShowTag
     end.
 
+start_session(U, R, AuthModule, StateData) ->
+   JID = jlib:make_jid(U, StateData#state.server, R),
+   SID = {now(), self()},
+   Conn = get_conn_type(StateData),
+   Info = [{ip, StateData#state.ip},
+           {conn, Conn},
+           {auth_module, AuthModule}],
+   ejabberd_sm:open_session(SID, U, StateData#state.server, R, Info),
+   change_shaper(StateData, JID),
+   {Fs, Ts, Pending} = ejabberd_hooks:run_fold(
+                         roster_get_subscription_lists,
+                         StateData#state.server,
+                         {[], [], []},
+                         [U, StateData#state.server]),
+   LJID = jlib:jid_tolower(jlib:jid_remove_resource(JID)),
+   Fs1 = [LJID | Fs],
+   Ts1 = [LJID | Ts],
+   BufferMax = get_buffer_max(),
+   AckFreq = get_ack_freq(),
+   ResumeTimeout = get_resume_timeout(),
+   NewState =
+     StateData#state{
+       stream_mgmt = true,
+       stream_mgmt_buffer_max = BufferMax,
+       stream_mgmt_ack_freq = AckFreq,
+       stream_mgmt_resume_timeout = ResumeTimeout,
+       user = U,
+       resource = R,
+       jid = JID,
+       sid = SID,
+       conn = Conn,
+       auth_module = AuthModule,
+       pres_f = ?SETS:from_list(Fs1),
+       pres_t = ?SETS:from_list(Ts1),
+       pending_invitations = Pending},
+   NewEl = {xmlel,<<"presence">>,
+                     [{<<"xml:lang">>,<<>>},{<<"type">>,<<"available">>}],
+                     [{xmlel,<<"x">>,
+                             [{<<"xmlns">>,<<"vcard-temp:x:update">>}],
+                             [{xmlel,<<"photo">>,[],[]}]}]},
+   ToJID = jlib:make_jid(U, StateData#state.server, <<>>),
+   PresenceEl = ejabberd_hooks:run_fold(
+                                       c2s_update_presence,
+                                       StateData#state.server,
+                                       NewEl,
+                                       [U, StateData#state.server]),
+   ejabberd_hooks:run(user_send_packet,
+                          StateData#state.server,
+                          [NewState#state.jid, ToJID, PresenceEl]),
+   presence_update(NewState#state.jid, PresenceEl, NewState),
+   NewState.
 
 -spec process_unauthenticated_stanza(State :: state(),
                                      El :: jlib:xmlel()) -> any().
@@ -2351,6 +2414,15 @@ process_unauthenticated_stanza(StateData, El) ->
 					  [StateData#state.server, IQ,
 					   StateData#state.ip]),
 	    case Res of
+                unauthorized -> ok;
+                {c2s_auth, U, R, AM} ->
+                    Reply = IQ#iq{type = result, sub_el = []},
+                    Res1 = jlib:replace_from_to(
+                             jlib:make_jid(<<>>, StateData#state.server, <<>>),
+                             jlib:make_jid(<<>>, <<>>, <<>>),
+                             jlib:iq_to_xml(Reply)),
+                    send_element(StateData, jlib:remove_attr(<<"to">>, Res1)),
+                    {c2s_auth, start_session(U, R, AM, StateData)};
 		empty ->
 		    % The only reasonable IQ's here are auth and register IQ's
 		    % They contain secrets, so don't include subelements to response
@@ -2953,13 +3025,20 @@ add_timestamp({_,_,Micro} = TimeStamp, Server, Packet) ->
     Time = {D,{H,M,S, Micro}},
     case xml:get_subtag(Packet, <<"delay">>) of
         false ->
-            TimeStampXML = timestamp_xml(Server, Time),
-            xml:append_subtags(Packet, [TimeStampXML]);
+            %% TODO: Delete the next element once XEP-0091 is Obsolete
+            TimeStampLegacyXML = timestamp_legacy_xml(Server, Time),
+            TimeStampXML = jlib:timestamp_to_xml(Time),
+            xml:append_subtags(Packet, [TimeStampLegacyXML, TimeStampXML]);
         _ ->
             Packet
     end.
 
-timestamp_xml(Server, Time) ->
+get_utc_timestamp() ->
+    {Mega,Sec,Micro} = os:timestamp(),
+    Int = ((Mega*1000000+Sec)*1000000+Micro) div 1000,
+    integer_to_binary(Int).
+
+timestamp_legacy_xml(Server, Time) ->
     FromJID = jlib:make_jid(<<>>, Server, <<>>),
     jlib:timestamp_to_xml(Time, utc, FromJID, <<"SM Storage">>).
 
